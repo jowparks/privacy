@@ -145,7 +145,7 @@ async fn run_vsock_server(state: Arc<AppState>, port: u32) -> Result<()> {
     use tokio_vsock::{VsockAddr, VsockListener};
 
     let addr = VsockAddr::new(nix::libc::VMADDR_CID_ANY, port);
-    let listener = VsockListener::bind(addr)?;
+    let mut listener = VsockListener::bind(addr)?;
     info!(cid = "ANY", port = port, "vsock server listening");
 
     loop {
