@@ -142,9 +142,10 @@ async fn run_raw_rpc_server(state: Arc<AppState>, port: u16) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 async fn run_vsock_server(state: Arc<AppState>, port: u32) -> Result<()> {
-    use tokio_vsock::VsockListener;
+    use tokio_vsock::{VsockAddr, VsockListener};
 
-    let listener = VsockListener::bind(libc::VMADDR_CID_ANY as u32, port)?;
+    let addr = VsockAddr::new(nix::libc::VMADDR_CID_ANY, port);
+    let listener = VsockListener::bind(addr)?;
     info!(cid = "ANY", port = port, "vsock server listening");
 
     loop {
