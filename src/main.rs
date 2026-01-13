@@ -202,11 +202,17 @@ async fn main() -> Result<()> {
     let rpc_handler = RpcHandler::new(Arc::clone(&enclave));
     let state = Arc::new(AppState { rpc_handler });
 
-    let use_vsock = std::env::var("USE_VSOCK").is_ok();
+    // Auto-detect: if NSM is available (we're in an enclave), use vsock
+    // Otherwise, check environment variables for explicit mode selection
+    let in_enclave = !enclave.is_local_mode();
+    let use_vsock = in_enclave || std::env::var("USE_VSOCK").is_ok();
     let use_raw_rpc = std::env::var("USE_RAW_RPC").is_ok();
 
     if use_vsock {
-        info!("Running vsock server on port {}", VSOCK_PORT);
+        info!(
+            "Running vsock server on port {} (enclave_detected={})",
+            VSOCK_PORT, in_enclave
+        );
         run_vsock_server(state, VSOCK_PORT).await
     } else if use_raw_rpc {
         let port: u16 = std::env::var("PORT")
