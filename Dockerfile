@@ -75,10 +75,8 @@ RUN linuxkit build --format kernel+initrd --no-sbom --name user-ramdisk ./eif/us
 # =============================================================================
 # Stage 4: Build EIF using eif_build from aws-nitro-enclaves-image-format
 # =============================================================================
-FROM rust:1.83-slim-bookworm AS eif-builder
-
-# Install git for cloning the repo
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+# Using full rust image which includes git, pkg-config, libssl-dev, etc.
+FROM rust:1.83 AS eif-builder
 
 RUN mkdir /build
 WORKDIR /build
