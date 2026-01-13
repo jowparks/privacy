@@ -7,7 +7,7 @@
 # Extract EIF: Use nitro-cli build-enclave (see below)
 
 # Stage 1: Build the Rust application
-FROM rust:1.75-slim-bookworm as builder
+FROM rust:1.83-slim-bookworm AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
