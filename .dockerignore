@@ -1,0 +1,21 @@
+# Build artifacts
+target/
+*.eif
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Documentation
+*.md
+!README.md
+
+# GitHub
+.github/
+
