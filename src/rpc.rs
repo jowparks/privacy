@@ -133,10 +133,10 @@ impl RpcHandler {
             .ok_or_else(|| EnclaveError::Config("AWS clients not configured".to_string()))
     }
 
-    /// Handles an incoming JSON-RPC request (async version)
-    pub async fn handle_async(&self, request_body: &[u8]) -> Vec<u8> {
+    /// Handles an incoming JSON-RPC request
+    pub async fn handle(&self, request_body: &[u8]) -> Vec<u8> {
         let response = match serde_json::from_slice::<RpcRequest>(request_body) {
-            Ok(request) => self.process_request_async(request).await,
+            Ok(request) => self.process_request(request).await,
             Err(e) => RpcResponse {
                 jsonrpc: "2.0".to_string(),
                 result: None,
@@ -154,30 +154,9 @@ impl RpcHandler {
         })
     }
 
-    /// Handles an incoming JSON-RPC request (sync version for non-AWS methods)
-    pub fn handle(&self, request_body: &[u8]) -> Vec<u8> {
-        let response = match serde_json::from_slice::<RpcRequest>(request_body) {
-            Ok(request) => self.process_request_sync(request),
-            Err(e) => RpcResponse {
-                jsonrpc: "2.0".to_string(),
-                result: None,
-                error: Some(RpcError {
-                    code: PARSE_ERROR,
-                    message: format!("Parse error: {}", e),
-                }),
-                id: serde_json::Value::Null,
-            },
-        };
-
-        serde_json::to_vec(&response).unwrap_or_else(|_| {
-            br#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"},"id":null}"#
-                .to_vec()
-        })
-    }
-
-    /// Processes a parsed RPC request (async version)
-    async fn process_request_async(&self, request: RpcRequest) -> RpcResponse {
-        debug!(method = %request.method, "Processing RPC request (async)");
+    /// Processes a parsed RPC request
+    async fn process_request(&self, request: RpcRequest) -> RpcResponse {
+        debug!(method = %request.method, "Processing RPC request");
 
         if request.jsonrpc != "2.0" {
             return RpcResponse {
@@ -208,72 +187,6 @@ impl RpcHandler {
             // Storage methods (async)
             "priv_storeKey" => self.handle_store_key(request.params).await,
             "priv_getKey" => self.handle_get_key(request.params).await,
-
-            _ => Err(EnclaveError::Rpc(format!(
-                "Method not found: {}",
-                request.method
-            ))),
-        };
-
-        match result {
-            Ok(value) => RpcResponse {
-                jsonrpc: "2.0".to_string(),
-                result: Some(value),
-                error: None,
-                id: request.id,
-            },
-            Err(e) => {
-                let code = match &e {
-                    EnclaveError::Rpc(msg) if msg.starts_with("Method not found") => {
-                        METHOD_NOT_FOUND
-                    }
-                    _ => INTERNAL_ERROR,
-                };
-                RpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    result: None,
-                    error: Some(RpcError {
-                        code,
-                        message: e.to_string(),
-                    }),
-                    id: request.id,
-                }
-            }
-        }
-    }
-
-    /// Processes a parsed RPC request (sync version - only for non-AWS methods)
-    fn process_request_sync(&self, request: RpcRequest) -> RpcResponse {
-        debug!(method = %request.method, "Processing RPC request (sync)");
-
-        if request.jsonrpc != "2.0" {
-            return RpcResponse {
-                jsonrpc: "2.0".to_string(),
-                result: None,
-                error: Some(RpcError {
-                    code: INVALID_REQUEST,
-                    message: "Invalid JSON-RPC version".to_string(),
-                }),
-                id: request.id,
-            };
-        }
-
-        let method = request.method.as_str();
-        let result = match method {
-            // Signing methods (sync)
-            "priv_signerPublicKey" => self.handle_signer_public_key(),
-            "priv_signerAttestation" => self.handle_signer_attestation(),
-            "priv_decryptionPublicKey" => self.handle_decryption_public_key(),
-            "priv_decryptionAttestation" => self.handle_decryption_attestation(),
-            "priv_setSignerKey" => self.handle_set_signer_key(request.params),
-            "priv_sign" => self.handle_sign(request.params),
-
-            // AWS methods require async - return error in sync mode
-            "priv_encrypt" | "priv_decrypt" | "priv_storeKey" | "priv_getKey" => {
-                Err(EnclaveError::Rpc(
-                    "AWS methods require async handling. Use handle_async() instead.".to_string()
-                ))
-            }
 
             _ => Err(EnclaveError::Rpc(format!(
                 "Method not found: {}",
@@ -500,11 +413,11 @@ mod tests {
         RpcHandler::new(enclave)
     }
 
-    #[test]
-    fn test_signer_public_key() {
+    #[tokio::test]
+    async fn test_signer_public_key() {
         let handler = create_handler();
         let request = br#"{"jsonrpc":"2.0","method":"priv_signerPublicKey","id":1}"#;
-        let response = handler.handle(request);
+        let response = handler.handle(request).await;
         let parsed: RpcResponse = serde_json::from_slice(&response).unwrap();
         assert!(parsed.error.is_none());
         let result = parsed.result.unwrap();
@@ -512,11 +425,11 @@ mod tests {
         assert!(key.starts_with("0x"));
     }
 
-    #[test]
-    fn test_signer_attestation() {
+    #[tokio::test]
+    async fn test_signer_attestation() {
         let handler = create_handler();
         let request = br#"{"jsonrpc":"2.0","method":"priv_signerAttestation","id":1}"#;
-        let response = handler.handle(request);
+        let response = handler.handle(request).await;
         let parsed: RpcResponse = serde_json::from_slice(&response).unwrap();
         assert!(parsed.error.is_none());
         let result = parsed.result.unwrap();
@@ -524,12 +437,12 @@ mod tests {
         assert!(attestation.starts_with("0x"));
     }
 
-    #[test]
-    fn test_sign() {
+    #[tokio::test]
+    async fn test_sign() {
         let handler = create_handler();
         // Sign hex-encoded "hello"
         let request = br#"{"jsonrpc":"2.0","method":"priv_sign","params":[{"message":"0x68656c6c6f"}],"id":1}"#;
-        let response = handler.handle(request);
+        let response = handler.handle(request).await;
         let parsed: RpcResponse = serde_json::from_slice(&response).unwrap();
         assert!(parsed.error.is_none());
         let result = parsed.result.unwrap();
@@ -537,11 +450,11 @@ mod tests {
         assert!(sig.starts_with("0x"));
     }
 
-    #[test]
-    fn test_method_not_found() {
+    #[tokio::test]
+    async fn test_method_not_found() {
         let handler = create_handler();
         let request = br#"{"jsonrpc":"2.0","method":"unknown","id":1}"#;
-        let response = handler.handle(request);
+        let response = handler.handle(request).await;
         let parsed: RpcResponse = serde_json::from_slice(&response).unwrap();
         assert!(parsed.error.is_some());
         assert_eq!(parsed.error.unwrap().code, METHOD_NOT_FOUND);
@@ -551,8 +464,7 @@ mod tests {
     async fn test_encrypt_without_aws_clients() {
         let handler = create_handler();
         let request = br#"{"jsonrpc":"2.0","method":"priv_encrypt","params":[{"plaintext":"0x68656c6c6f"}],"id":1}"#;
-        // Use async handler for AWS methods
-        let response = handler.handle_async(request).await;
+        let response = handler.handle(request).await;
         let parsed: RpcResponse = serde_json::from_slice(&response).unwrap();
         // Should fail because AWS clients not configured
         assert!(parsed.error.is_some());
