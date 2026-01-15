@@ -1,6 +1,6 @@
 //! Privacy Enclave Server
 //!
-//! A Rust enclave server for AWS Nitro Enclaves with KMS and DynamoDB integration.
+//! A Rust enclave server for AWS Nitro Enclaves.
 //!
 //! This server listens on vsock port 1234 for raw JSON-RPC requests.
 //!
@@ -9,15 +9,6 @@
 //! - **vsock** (production): `USE_VSOCK=1` - Listens on vsock port 1234
 //! - **raw RPC** (testing): `USE_RAW_RPC=1` - Listens on TCP for testing
 //! - **HTTP** (development): Default - HTTP server for curl testing
-//!
-//! # Environment Variables
-//!
-//! - `AWS_REGION`: AWS region (default: us-east-1)
-//! - `KMS_KEY_ID`: KMS key ID or ARN for enclave-sealed encryption
-//! - `DYNAMODB_TABLE`: DynamoDB table name for encrypted storage
-//! - `USE_VSOCK`: Set to enable vsock mode
-//! - `USE_RAW_RPC`: Set to enable raw RPC mode
-//! - `PORT`: Port for HTTP/raw RPC mode
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -26,7 +17,6 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{body::Incoming, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use privacy_enclave::aws::{AwsClients, AwsEnclaveConfig};
 use privacy_enclave::enclave::EnclaveServer;
 use privacy_enclave::rpc::RpcHandler;
 use std::convert::Infallible;
@@ -34,8 +24,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
-use tracing::{error, info, warn, Level};
+use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 /// Default vsock port
@@ -57,8 +46,7 @@ async fn handle_http_request(
             match req.collect().await {
                 Ok(body) => {
                     let body_bytes = body.to_bytes();
-                    // Use async handler to support KMS/DynamoDB operations
-                    let response_bytes = state.rpc_handler.handle_async(&body_bytes).await;
+                    let response_bytes = state.rpc_handler.handle(&body_bytes);
                     Response::builder()
                         .status(StatusCode::OK)
                         .header("Content-Type", "application/json")
@@ -126,30 +114,29 @@ async fn run_raw_rpc_server(state: Arc<AppState>, port: u16) -> Result<()> {
             let mut reader = BufReader::new(reader);
             let mut line = String::new();
 
-                    loop {
-                        line.clear();
-                        match reader.read_line(&mut line).await {
-                            Ok(0) => break,
-                            Ok(_) => {
-                                // Use async handler to support KMS/DynamoDB operations
-                                let response = state.rpc_handler.handle_async(line.trim().as_bytes()).await;
-                                if writer.write_all(&response).await.is_err() {
-                                    break;
-                                }
-                                if writer.write_all(b"\n").await.is_err() {
-                                    break;
-                                }
-                                if writer.flush().await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                error!(remote_addr = %remote_addr, error = %e, "Read error");
-                                break;
-                            }
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let response = state.rpc_handler.handle(line.trim().as_bytes());
+                        if writer.write_all(&response).await.is_err() {
+                            break;
+                        }
+                        if writer.write_all(b"\n").await.is_err() {
+                            break;
+                        }
+                        if writer.flush().await.is_err() {
+                            break;
                         }
                     }
-                });
+                    Err(e) => {
+                        error!(remote_addr = %remote_addr, error = %e, "Read error");
+                        break;
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -175,8 +162,7 @@ async fn run_vsock_server(state: Arc<AppState>, port: u32) -> Result<()> {
                 match reader.read_line(&mut line).await {
                     Ok(0) => break,
                     Ok(_) => {
-                        // Use async handler to support KMS/DynamoDB operations
-                        let response = state.rpc_handler.handle_async(line.trim().as_bytes()).await;
+                        let response = state.rpc_handler.handle(line.trim().as_bytes());
                         if writer.write_all(&response).await.is_err() {
                             break;
                         }
@@ -213,35 +199,7 @@ async fn main() -> Result<()> {
     info!("Starting Privacy Enclave Server...");
 
     let enclave = Arc::new(EnclaveServer::new()?);
-
-    // Try to initialize AWS clients if environment variables are set
-    let rpc_handler = match AwsEnclaveConfig::from_env() {
-        Ok(config) => {
-            info!(
-                region = %config.region,
-                kms_key = %config.kms_key_id,
-                table = %config.dynamodb_table,
-                "AWS configuration found, initializing clients"
-            );
-            match AwsClients::new(config).await {
-                Ok(clients) => {
-                    info!("AWS clients initialized successfully");
-                    let aws_clients = Arc::new(RwLock::new(clients));
-                    RpcHandler::with_aws(Arc::clone(&enclave), aws_clients)
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to initialize AWS clients, running without AWS support");
-                    RpcHandler::new(Arc::clone(&enclave))
-                }
-            }
-        }
-        Err(e) => {
-            info!(reason = %e, "AWS not configured, running without AWS support");
-            info!("Set KMS_KEY_ID and DYNAMODB_TABLE to enable KMS/DynamoDB operations");
-            RpcHandler::new(Arc::clone(&enclave))
-        }
-    };
-
+    let rpc_handler = RpcHandler::new(Arc::clone(&enclave));
     let state = Arc::new(AppState { rpc_handler });
 
     // Auto-detect: if NSM is available (we're in an enclave), use vsock

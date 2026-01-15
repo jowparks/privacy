@@ -13,19 +13,31 @@
 //!
 //! # DynamoDB proxy (port 8001)
 //! vsock-proxy 8001 dynamodb.us-east-1.amazonaws.com 443 &
-//!
-//! # Credentials proxy (port 8002) - for instance metadata
-//! vsock-proxy 8002 169.254.169.254 80 &
 //! ```
 
 use crate::dynamodb::EnclaveStorage;
-use crate::error::{EnclaveError, Result};
+use crate::error::Result;
 use crate::kms::EnclaveKms;
 use crate::vsock_transport::{VsockConfig, VsockHttpConnector};
 use aws_config::Region;
 use aws_sdk_dynamodb::Client as DynamoClient;
 use aws_sdk_kms::Client as KmsClient;
 use tracing::info;
+
+// =============================================================================
+// HARDCODED CONFIGURATION - Update these values for your environment
+// =============================================================================
+
+/// AWS region
+pub const AWS_REGION: &str = "us-east-1";
+
+/// You could also use alias/enclave-key instead of the key ARN, but alias can be changed
+pub const KMS_KEY_ID: &str = "arn:aws:kms:us-east-1:420699761259:key/34d684a5-5ffe-49d2-8ca2-ba1cd4a7524d";
+
+/// DynamoDB table name for encrypted storage
+pub const DYNAMODB_TABLE: &str = "privacy-enclave-data-development";
+
+// =============================================================================
 
 /// Configuration for AWS services in the enclave
 #[derive(Debug, Clone)]
@@ -38,6 +50,12 @@ pub struct AwsEnclaveConfig {
     pub dynamodb_table: String,
     /// Vsock configuration
     pub vsock: VsockConfig,
+}
+
+impl Default for AwsEnclaveConfig {
+    fn default() -> Self {
+        Self::new(AWS_REGION, KMS_KEY_ID, DYNAMODB_TABLE)
+    }
 }
 
 impl AwsEnclaveConfig {
@@ -54,22 +72,6 @@ impl AwsEnclaveConfig {
             kms_key_id: kms_key_id.into(),
             dynamodb_table: dynamodb_table.into(),
         }
-    }
-
-    /// Creates configuration from environment variables
-    ///
-    /// Expected environment variables:
-    /// - `AWS_REGION`: AWS region (default: us-east-1)
-    /// - `KMS_KEY_ID`: KMS key ID or ARN
-    /// - `DYNAMODB_TABLE`: DynamoDB table name
-    pub fn from_env() -> Result<Self> {
-        let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
-        let kms_key_id = std::env::var("KMS_KEY_ID")
-            .map_err(|_| EnclaveError::Config("KMS_KEY_ID environment variable not set".into()))?;
-        let dynamodb_table = std::env::var("DYNAMODB_TABLE")
-            .map_err(|_| EnclaveError::Config("DYNAMODB_TABLE environment variable not set".into()))?;
-
-        Ok(Self::new(region, kms_key_id, dynamodb_table))
     }
 }
 
@@ -240,6 +242,14 @@ mod tests {
         assert_eq!(config.region, "us-west-2");
         assert!(config.kms_key_id.contains("abc"));
         assert_eq!(config.dynamodb_table, "my-table");
+    }
+
+    #[test]
+    fn test_config_default() {
+        let config = AwsEnclaveConfig::default();
+        assert_eq!(config.region, AWS_REGION);
+        assert_eq!(config.kms_key_id, KMS_KEY_ID);
+        assert_eq!(config.dynamodb_table, DYNAMODB_TABLE);
     }
 }
 
