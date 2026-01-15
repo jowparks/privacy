@@ -123,18 +123,22 @@ async fn vsock_send_request(
     use http_body_util::{BodyExt, Full};
     use hyper::client::conn::http1::Builder;
     use hyper_util::rt::TokioIo;
-    use tokio_vsock::VsockStream;
+    use tokio_vsock::{VsockAddr, VsockStream};
 
-    let uri = request.uri().to_string();
-    let host = uri.split("://")
+    let uri_string = format!("{}", request.uri());
+    let host = uri_string.split("://")
         .nth(1)
         .and_then(|s| s.split('/').next())
         .and_then(|s| s.split(':').next())
         .unwrap_or("localhost");
     let port = config.port_for_endpoint(host);
 
+    // Get the method before consuming the request
+    let method_str = request.method().to_string();
+
     // Connect via vsock to the parent instance
-    let stream = VsockStream::connect(VSOCK_CID_HOST, port)
+    let vsock_addr = VsockAddr::new(VSOCK_CID_HOST, port);
+    let stream = VsockStream::connect(vsock_addr)
         .await
         .map_err(|e| ConnectorError::io(e.into()))?;
 
@@ -156,19 +160,19 @@ async fn vsock_send_request(
     // Convert the SDK request to hyper request
     let req_parts = request.into_parts();
     
-    // Read the body
-    let body_bytes = req_parts.body
+    // Read the body - bytes() returns Option<&[u8]>, not a future
+    let body_bytes: Vec<u8> = req_parts.body
         .bytes()
-        .await
-        .map_err(|e| ConnectorError::other(e.into(), None))?;
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
 
     // Build a new hyper request with the body
     let mut hyper_request = hyper::Request::builder()
-        .method(req_parts.method.as_str())
-        .uri(req_parts.uri.to_string());
+        .method(method_str.as_str())
+        .uri(format!("{}", req_parts.uri));
     
     for (name, value) in req_parts.headers.iter() {
-        hyper_request = hyper_request.header(name.as_str(), value.as_bytes());
+        hyper_request = hyper_request.header(name.to_string(), value.as_bytes());
     }
     
     let hyper_request = hyper_request
