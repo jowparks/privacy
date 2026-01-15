@@ -133,8 +133,9 @@ async fn vsock_send_request(
         .unwrap_or("localhost");
     let port = config.port_for_endpoint(host);
 
-    // Get the method before consuming the request
+    // Get the method and URI before consuming the request
     let method_str = request.method().to_string();
+    let uri_for_request = request.uri().to_string();
 
     // Connect via vsock to the parent instance
     let vsock_addr = VsockAddr::new(VSOCK_CID_HOST, port);
@@ -169,7 +170,7 @@ async fn vsock_send_request(
     // Build a new hyper request with the body
     let mut hyper_request = hyper::Request::builder()
         .method(method_str.as_str())
-        .uri(format!("{}", req_parts.uri));
+        .uri(&uri_for_request);
     
     for (name, value) in req_parts.headers.iter() {
         hyper_request = hyper_request.header(name.to_string(), value.as_bytes());
