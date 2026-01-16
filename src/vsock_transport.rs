@@ -336,15 +336,16 @@ async fn vsock_send_request(
             );
         }
 
-        if let Ok(header_value) = aws_smithy_runtime_api::http::HeaderValue::try_from(value.as_bytes().to_vec()) {
+        // Convert header value to string - Headers::insert accepts String which implements AsHeaderComponent
+        if let Ok(header_value_str) = value.to_str() {
             sdk_response.headers_mut().insert(
-                aws_smithy_runtime_api::http::HeaderName::from(name.as_str()),
-                header_value,
+                name.as_str().to_string(),
+                header_value_str.to_string(),
             );
         } else {
             tracing::warn!(
                 header_name = %name,
-                "[VSOCK] Failed to convert response header value"
+                "[VSOCK] Failed to convert response header value to string (non-UTF8)"
             );
         }
     }
