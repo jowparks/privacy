@@ -319,13 +319,41 @@ async fn vsock_send_request(
         body_len = body_bytes.len(),
         body_preview = %body_preview,
         elapsed_ms = start.elapsed().as_millis(),
+        header_count = parts.headers.len(),
         "[VSOCK] Step 7: Request complete!"
     );
 
-    let sdk_response = aws_smithy_runtime_api::client::orchestrator::HttpResponse::new(
+    // Build SDK response with headers preserved from the upstream response
+    // This is critical for IMDS which requires the x-aws-ec2-metadata-token-ttl-seconds header
+    let mut sdk_response = aws_smithy_runtime_api::client::orchestrator::HttpResponse::new(
         status_code,
         SdkBody::from(body_bytes),
     );
+
+    // Copy all response headers from the upstream response
+    // This is critical for IMDS which requires the x-aws-ec2-metadata-token-ttl-seconds header
+    for (name, value) in parts.headers.iter() {
+        // Log the TTL header specifically as it's required by the AWS SDK for IMDS
+        if name.as_str().eq_ignore_ascii_case("x-aws-ec2-metadata-token-ttl-seconds") {
+            tracing::debug!(
+                header_name = %name,
+                header_value = %String::from_utf8_lossy(value.as_bytes()),
+                "[VSOCK] Found IMDS TTL header"
+            );
+        }
+
+        if let Ok(header_value) = aws_smithy_runtime_api::http::HeaderValue::try_from(value.as_bytes().to_vec()) {
+            sdk_response.headers_mut().insert(
+                aws_smithy_runtime_api::http::HeaderName::from(name.as_str()),
+                header_value,
+            );
+        } else {
+            tracing::warn!(
+                header_name = %name,
+                "[VSOCK] Failed to convert response header value"
+            );
+        }
+    }
 
     Ok(sdk_response)
 }
