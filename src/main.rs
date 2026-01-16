@@ -17,7 +17,6 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{body::Incoming, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use privacy_enclave::aws::{AwsClients, AwsEnclaveConfig};
 use privacy_enclave::enclave::EnclaveServer;
 use privacy_enclave::rpc::RpcHandler;
 use std::convert::Infallible;
@@ -25,7 +24,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -48,7 +46,7 @@ async fn handle_http_request(
             match req.collect().await {
                 Ok(body) => {
                     let body_bytes = body.to_bytes();
-                    let response_bytes = state.rpc_handler.handle(&body_bytes).await;
+                    let response_bytes = state.rpc_handler.handle(&body_bytes);
                     Response::builder()
                         .status(StatusCode::OK)
                         .header("Content-Type", "application/json")
@@ -121,7 +119,7 @@ async fn run_raw_rpc_server(state: Arc<AppState>, port: u16) -> Result<()> {
                 match reader.read_line(&mut line).await {
                     Ok(0) => break,
                     Ok(_) => {
-                        let response = state.rpc_handler.handle(line.trim().as_bytes()).await;
+                        let response = state.rpc_handler.handle(line.trim().as_bytes());
                         if writer.write_all(&response).await.is_err() {
                             break;
                         }
@@ -164,7 +162,7 @@ async fn run_vsock_server(state: Arc<AppState>, port: u32) -> Result<()> {
                 match reader.read_line(&mut line).await {
                     Ok(0) => break,
                     Ok(_) => {
-                        let response = state.rpc_handler.handle(line.trim().as_bytes()).await;
+                        let response = state.rpc_handler.handle(line.trim().as_bytes());
                         if writer.write_all(&response).await.is_err() {
                             break;
                         }
@@ -190,13 +188,6 @@ async fn run_vsock_server(_state: Arc<AppState>, _port: u32) -> Result<()> {
     anyhow::bail!("vsock is only supported on Linux")
 }
 
-/// Initialize AWS clients for the enclave
-async fn init_aws_clients() -> Result<AwsClients> {
-    let config = AwsEnclaveConfig::default();
-    let clients = AwsClients::new(config).await?;
-    Ok(clients)
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let subscriber = FmtSubscriber::builder()
@@ -208,20 +199,14 @@ async fn main() -> Result<()> {
     info!("Starting Privacy Enclave Server...");
 
     let enclave = Arc::new(EnclaveServer::new()?);
-    
+    let rpc_handler = RpcHandler::new(Arc::clone(&enclave));
+    let state = Arc::new(AppState { rpc_handler });
+
     // Auto-detect: if NSM is available (we're in an enclave), use vsock
     // Otherwise, check environment variables for explicit mode selection
     let in_enclave = !enclave.is_local_mode();
     let use_vsock = in_enclave || std::env::var("USE_VSOCK").is_ok();
     let use_raw_rpc = std::env::var("USE_RAW_RPC").is_ok();
-    
-    // Initialize AWS clients
-    info!("Initializing AWS clients...");
-    let aws_clients = init_aws_clients().await?;
-    info!("AWS clients initialized successfully");
-    let rpc_handler = RpcHandler::with_aws(Arc::clone(&enclave), Arc::new(RwLock::new(aws_clients)));
-    
-    let state = Arc::new(AppState { rpc_handler });
 
     if use_vsock {
         info!(

@@ -22,15 +22,6 @@ pub enum EnclaveError {
 
     #[error("RPC error: {0}")]
     Rpc(String),
-
-    #[error("KMS error: {0}")]
-    Kms(String),
-
-    #[error("DynamoDB error: {0}")]
-    DynamoDb(String),
-
-    #[error("Configuration error: {0}")]
-    Config(String),
 }
 
 pub type Result<T> = std::result::Result<T, EnclaveError>;

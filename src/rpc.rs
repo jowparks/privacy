@@ -5,29 +5,18 @@
 //!
 //! ## Supported Methods
 //!
-//! ### Key Management
 //! - `priv_signerPublicKey`: Returns the enclave's public signing key
 //! - `priv_signerAttestation`: Returns an attestation document for the signer key
 //! - `priv_decryptionPublicKey`: Returns the enclave's decryption public key
 //! - `priv_decryptionAttestation`: Returns an attestation for the decryption key
 //! - `priv_setSignerKey`: Sets the signer key (encrypted)
 //! - `priv_sign`: Signs a message with the enclave's signing key
-//!
-//! ### KMS Operations (attestation-sealed)
-//! - `priv_encrypt`: Encrypts data with the enclave-sealed KMS key
-//! - `priv_decrypt`: Decrypts data using attestation (enclave only)
-//!
-//! ### Storage Operations
-//! - `priv_storeKey`: Stores an encrypted key in DynamoDB
-//! - `priv_getKey`: Retrieves and decrypts a key from DynamoDB
 
-use crate::aws::AwsClients;
 use crate::enclave::EnclaveServer;
 use crate::error::{EnclaveError, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// JSON-RPC request structure
 #[derive(Debug, Deserialize)]
@@ -70,73 +59,21 @@ pub struct SignParams {
     pub message: String,
 }
 
-/// Parameters for encrypt method
-#[derive(Debug, Deserialize)]
-pub struct EncryptParams {
-    /// Hex-encoded plaintext to encrypt (with or without 0x prefix)
-    pub plaintext: String,
-}
-
-/// Parameters for decrypt method
-#[derive(Debug, Deserialize)]
-pub struct DecryptParams {
-    /// Hex-encoded ciphertext to decrypt (with or without 0x prefix)
-    pub ciphertext: String,
-}
-
-/// Parameters for storeKey method
-#[derive(Debug, Deserialize)]
-pub struct StoreKeyParams {
-    /// Unique key identifier
-    pub key_id: String,
-    /// Key type (e.g., "signing", "encryption")
-    pub key_type: String,
-    /// Hex-encoded key data (with or without 0x prefix)
-    pub key_data: String,
-}
-
-/// Parameters for getKey method
-#[derive(Debug, Deserialize)]
-pub struct GetKeyParams {
-    /// Key identifier to retrieve
-    pub key_id: String,
-}
-
-
 /// RPC handler for the enclave
 pub struct RpcHandler {
     enclave: Arc<EnclaveServer>,
-    aws_clients: Option<Arc<RwLock<AwsClients>>>,
 }
 
 impl RpcHandler {
-    /// Creates a new RPC handler without AWS clients
+    /// Creates a new RPC handler
     pub fn new(enclave: Arc<EnclaveServer>) -> Self {
-        Self {
-            enclave,
-            aws_clients: None,
-        }
-    }
-
-    /// Creates a new RPC handler with AWS clients
-    pub fn with_aws(enclave: Arc<EnclaveServer>, aws_clients: Arc<RwLock<AwsClients>>) -> Self {
-        Self {
-            enclave,
-            aws_clients: Some(aws_clients),
-        }
-    }
-
-    /// Returns reference to AWS clients if configured
-    fn aws(&self) -> Result<&Arc<RwLock<AwsClients>>> {
-        self.aws_clients
-            .as_ref()
-            .ok_or_else(|| EnclaveError::Config("AWS clients not configured".to_string()))
+        Self { enclave }
     }
 
     /// Handles an incoming JSON-RPC request
-    pub async fn handle(&self, request_body: &[u8]) -> Vec<u8> {
+    pub fn handle(&self, request_body: &[u8]) -> Vec<u8> {
         let response = match serde_json::from_slice::<RpcRequest>(request_body) {
-            Ok(request) => self.process_request(request).await,
+            Ok(request) => self.process_request(request),
             Err(e) => RpcResponse {
                 jsonrpc: "2.0".to_string(),
                 result: None,
@@ -155,7 +92,7 @@ impl RpcHandler {
     }
 
     /// Processes a parsed RPC request
-    async fn process_request(&self, request: RpcRequest) -> RpcResponse {
+    fn process_request(&self, request: RpcRequest) -> RpcResponse {
         debug!(method = %request.method, "Processing RPC request");
 
         if request.jsonrpc != "2.0" {
@@ -172,21 +109,13 @@ impl RpcHandler {
 
         let method = request.method.as_str();
         let result = match method {
-            // Signing methods (sync)
+            // Privacy enclave methods
             "priv_signerPublicKey" => self.handle_signer_public_key(),
             "priv_signerAttestation" => self.handle_signer_attestation(),
             "priv_decryptionPublicKey" => self.handle_decryption_public_key(),
             "priv_decryptionAttestation" => self.handle_decryption_attestation(),
             "priv_setSignerKey" => self.handle_set_signer_key(request.params),
             "priv_sign" => self.handle_sign(request.params),
-
-            // KMS methods (async)
-            "priv_encrypt" => self.handle_encrypt(request.params).await,
-            "priv_decrypt" => self.handle_decrypt(request.params).await,
-
-            // Storage methods (async)
-            "priv_storeKey" => self.handle_store_key(request.params).await,
-            "priv_getKey" => self.handle_get_key(request.params).await,
 
             _ => Err(EnclaveError::Rpc(format!(
                 "Method not found: {}",
@@ -293,115 +222,6 @@ impl RpcHandler {
 
         Ok(serde_json::Value::String(format!("0x{}", hex::encode(&signature))))
     }
-
-    // ========================================================================
-    // KMS Methods
-    // ========================================================================
-
-    /// Handles "priv_encrypt" - encrypts data with the enclave KMS key
-    async fn handle_encrypt(&self, params: Option<serde_json::Value>) -> Result<serde_json::Value> {
-        let params: EncryptParams = parse_params(params)?;
-        let plaintext_hex = params.plaintext.strip_prefix("0x").unwrap_or(&params.plaintext);
-        let plaintext = hex::decode(plaintext_hex)
-            .map_err(|e| EnclaveError::Rpc(format!("Invalid hex plaintext: {}", e)))?;
-
-        let aws = self.aws()?;
-        let clients = aws.read().await;
-        let ciphertext = clients.kms.encrypt(&plaintext).await?;
-
-        Ok(serde_json::Value::String(format!("0x{}", hex::encode(&ciphertext))))
-    }
-
-    /// Handles "priv_decrypt" - decrypts data using attestation
-    async fn handle_decrypt(&self, params: Option<serde_json::Value>) -> Result<serde_json::Value> {
-        let params: DecryptParams = parse_params(params)?;
-        let ciphertext_hex = params.ciphertext.strip_prefix("0x").unwrap_or(&params.ciphertext);
-        let ciphertext = hex::decode(ciphertext_hex)
-            .map_err(|e| EnclaveError::Rpc(format!("Invalid hex ciphertext: {}", e)))?;
-
-        // Get attestation document from NSM
-        let attestation = self.enclave.get_attestation(None)?;
-
-        let aws = self.aws()?;
-        let clients = aws.read().await;
-        let plaintext = clients
-            .kms
-            .decrypt_with_attestation(&ciphertext, attestation.document)
-            .await?;
-
-        Ok(serde_json::Value::String(format!("0x{}", hex::encode(&plaintext))))
-    }
-
-    // ========================================================================
-    // Storage Methods
-    // ========================================================================
-
-    /// Handles "priv_storeKey" - stores an encrypted key
-    async fn handle_store_key(&self, params: Option<serde_json::Value>) -> Result<serde_json::Value> {
-        let params: StoreKeyParams = parse_params(params)?;
-        let key_data_hex = params.key_data.strip_prefix("0x").unwrap_or(&params.key_data);
-        let key_data = hex::decode(key_data_hex)
-            .map_err(|e| EnclaveError::Rpc(format!("Invalid hex key_data: {}", e)))?;
-
-        info!(key_id = %params.key_id, key_type = %params.key_type, "Storing key via RPC");
-
-        let aws = self.aws()?;
-        let clients = aws.read().await;
-        clients
-            .store_encrypted_key(&params.key_id, &params.key_type, &key_data)
-            .await?;
-
-        Ok(serde_json::json!({
-            "success": true,
-            "key_id": params.key_id
-        }))
-    }
-
-    /// Handles "priv_getKey" - retrieves and decrypts a key
-    async fn handle_get_key(&self, params: Option<serde_json::Value>) -> Result<serde_json::Value> {
-        let params: GetKeyParams = parse_params(params)?;
-
-        info!(key_id = %params.key_id, "Getting key via RPC");
-
-        // Get attestation for decryption
-        let attestation = self.enclave.get_attestation(None)?;
-
-        let aws = self.aws()?;
-        let clients = aws.read().await;
-        let key_data = clients
-            .get_decrypted_key(&params.key_id, attestation.document)
-            .await?;
-
-        match key_data {
-            Some(data) => Ok(serde_json::json!({
-                "found": true,
-                "key_id": params.key_id,
-                "key_data": format!("0x{}", hex::encode(&data))
-            })),
-            None => Ok(serde_json::json!({
-                "found": false,
-                "key_id": params.key_id
-            })),
-        }
-    }
-
-}
-
-/// Helper to parse RPC params
-fn parse_params<T: serde::de::DeserializeOwned>(params: Option<serde_json::Value>) -> Result<T> {
-    params
-        .and_then(|p| {
-            if p.is_array() {
-                p.as_array().and_then(|arr| arr.first().cloned())
-            } else {
-                Some(p)
-            }
-        })
-        .ok_or_else(|| EnclaveError::Rpc("Missing params".to_string()))
-        .and_then(|p| {
-            serde_json::from_value(p)
-                .map_err(|e| EnclaveError::Rpc(format!("Invalid params: {}", e)))
-        })
 }
 
 #[cfg(test)]
@@ -413,11 +233,11 @@ mod tests {
         RpcHandler::new(enclave)
     }
 
-    #[tokio::test]
-    async fn test_signer_public_key() {
+    #[test]
+    fn test_signer_public_key() {
         let handler = create_handler();
         let request = br#"{"jsonrpc":"2.0","method":"priv_signerPublicKey","id":1}"#;
-        let response = handler.handle(request).await;
+        let response = handler.handle(request);
         let parsed: RpcResponse = serde_json::from_slice(&response).unwrap();
         assert!(parsed.error.is_none());
         let result = parsed.result.unwrap();
@@ -425,11 +245,11 @@ mod tests {
         assert!(key.starts_with("0x"));
     }
 
-    #[tokio::test]
-    async fn test_signer_attestation() {
+    #[test]
+    fn test_signer_attestation() {
         let handler = create_handler();
         let request = br#"{"jsonrpc":"2.0","method":"priv_signerAttestation","id":1}"#;
-        let response = handler.handle(request).await;
+        let response = handler.handle(request);
         let parsed: RpcResponse = serde_json::from_slice(&response).unwrap();
         assert!(parsed.error.is_none());
         let result = parsed.result.unwrap();
@@ -437,12 +257,12 @@ mod tests {
         assert!(attestation.starts_with("0x"));
     }
 
-    #[tokio::test]
-    async fn test_sign() {
+    #[test]
+    fn test_sign() {
         let handler = create_handler();
         // Sign hex-encoded "hello"
         let request = br#"{"jsonrpc":"2.0","method":"priv_sign","params":[{"message":"0x68656c6c6f"}],"id":1}"#;
-        let response = handler.handle(request).await;
+        let response = handler.handle(request);
         let parsed: RpcResponse = serde_json::from_slice(&response).unwrap();
         assert!(parsed.error.is_none());
         let result = parsed.result.unwrap();
@@ -450,37 +270,13 @@ mod tests {
         assert!(sig.starts_with("0x"));
     }
 
-    #[tokio::test]
-    async fn test_method_not_found() {
+    #[test]
+    fn test_method_not_found() {
         let handler = create_handler();
         let request = br#"{"jsonrpc":"2.0","method":"unknown","id":1}"#;
-        let response = handler.handle(request).await;
+        let response = handler.handle(request);
         let parsed: RpcResponse = serde_json::from_slice(&response).unwrap();
         assert!(parsed.error.is_some());
         assert_eq!(parsed.error.unwrap().code, METHOD_NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_encrypt_without_aws_clients() {
-        let handler = create_handler();
-        let request = br#"{"jsonrpc":"2.0","method":"priv_encrypt","params":[{"plaintext":"0x68656c6c6f"}],"id":1}"#;
-        let response = handler.handle(request).await;
-        let parsed: RpcResponse = serde_json::from_slice(&response).unwrap();
-        // Should fail because AWS clients not configured
-        assert!(parsed.error.is_some());
-        assert!(parsed.error.unwrap().message.contains("AWS clients not configured"));
-    }
-
-    #[test]
-    fn test_parse_params() {
-        // Test with object
-        let params = Some(serde_json::json!({"key_id": "test"}));
-        let parsed: GetKeyParams = parse_params(params).unwrap();
-        assert_eq!(parsed.key_id, "test");
-
-        // Test with array (common in JSON-RPC)
-        let params = Some(serde_json::json!([{"key_id": "test2"}]));
-        let parsed: GetKeyParams = parse_params(params).unwrap();
-        assert_eq!(parsed.key_id, "test2");
     }
 }
