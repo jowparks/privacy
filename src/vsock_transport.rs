@@ -124,7 +124,9 @@ async fn vsock_send_request(
     use hyper::client::conn::http1::Builder;
     use hyper_util::rt::TokioIo;
     use tokio_vsock::{VsockAddr, VsockStream};
+    use std::time::Instant;
 
+    let start = Instant::now();
     let uri_string = format!("{}", request.uri());
     let host = uri_string.split("://")
         .nth(1)
@@ -137,11 +139,41 @@ async fn vsock_send_request(
     let method_str = request.method().to_string();
     let uri_for_request = request.uri().to_string();
 
+    tracing::info!(
+        method = %method_str,
+        host = %host,
+        vsock_cid = VSOCK_CID_HOST,
+        vsock_port = port,
+        "[VSOCK] Step 1: Initiating connection to vsock-proxy"
+    );
+
     // Connect via vsock to the parent instance
     let vsock_addr = VsockAddr::new(VSOCK_CID_HOST, port);
     let stream = VsockStream::connect(vsock_addr)
         .await
-        .map_err(|e| ConnectorError::io(e.into()))?;
+        .map_err(|e| {
+            tracing::error!(
+                error = %e,
+                host = %host,
+                vsock_cid = VSOCK_CID_HOST,
+                vsock_port = port,
+                elapsed_ms = start.elapsed().as_millis(),
+                "[VSOCK] FAILED at Step 1: Cannot connect to vsock. \
+                 Ensure vsock-proxy is running on parent: \
+                 vsock-proxy {} {}.{}.amazonaws.com 443",
+                port,
+                if host.contains("kms") { "kms" } 
+                else if host.contains("dynamodb") { "dynamodb" }
+                else { "sts" },
+                config.region
+            );
+            ConnectorError::io(e.into())
+        })?;
+
+    tracing::info!(
+        elapsed_ms = start.elapsed().as_millis(),
+        "[VSOCK] Step 2: vsock connected, starting HTTP handshake"
+    );
 
     let io = TokioIo::new(stream);
 
@@ -149,12 +181,31 @@ async fn vsock_send_request(
     let (mut sender, conn) = Builder::new()
         .handshake(io)
         .await
-        .map_err(|e| ConnectorError::other(e.into(), None))?;
+        .map_err(|e| {
+            tracing::error!(
+                error = %e,
+                host = %host,
+                elapsed_ms = start.elapsed().as_millis(),
+                "[VSOCK] FAILED at Step 2: HTTP handshake failed. \
+                 vsock-proxy may not be forwarding correctly to AWS"
+            );
+            ConnectorError::other(e.into(), None)
+        })?;
+
+    tracing::info!(
+        elapsed_ms = start.elapsed().as_millis(),
+        "[VSOCK] Step 3: HTTP handshake complete, spawning connection handler"
+    );
 
     // Spawn connection handler
+    let host_for_spawn = host.to_string();
     tokio::spawn(async move {
         if let Err(e) = conn.await {
-            tracing::error!(error = %e, "vsock connection error");
+            tracing::error!(
+                error = %e, 
+                host = %host_for_spawn,
+                "[VSOCK] Connection handler error"
+            );
         }
     });
 
@@ -167,6 +218,14 @@ async fn vsock_send_request(
         .map(|b| b.to_vec())
         .unwrap_or_default();
 
+    tracing::info!(
+        method = %method_str,
+        uri = %uri_for_request,
+        body_len = body_bytes.len(),
+        header_count = req_parts.headers.len(),
+        "[VSOCK] Step 4: Building HTTP request"
+    );
+
     // Build a new hyper request with the body
     let mut hyper_request = hyper::Request::builder()
         .method(method_str.as_str())
@@ -178,24 +237,74 @@ async fn vsock_send_request(
     
     let hyper_request = hyper_request
         .body(Full::new(Bytes::from(body_bytes)))
-        .map_err(|e| ConnectorError::other(e.into(), None))?;
+        .map_err(|e| {
+            tracing::error!(
+                error = %e,
+                "[VSOCK] FAILED at Step 4: Failed to build HTTP request"
+            );
+            ConnectorError::other(e.into(), None)
+        })?;
+
+    tracing::info!(
+        elapsed_ms = start.elapsed().as_millis(),
+        "[VSOCK] Step 5: Sending HTTP request..."
+    );
 
     // Send request
     let response = sender
         .send_request(hyper_request)
         .await
-        .map_err(|e| ConnectorError::other(e.into(), None))?;
+        .map_err(|e| {
+            tracing::error!(
+                error = %e,
+                uri = %uri_for_request,
+                elapsed_ms = start.elapsed().as_millis(),
+                "[VSOCK] FAILED at Step 5: HTTP request failed. \
+                 Check if vsock-proxy can reach AWS endpoint"
+            );
+            ConnectorError::other(e.into(), None)
+        })?;
 
     // Convert response back to SDK format
     let (parts, body) = response.into_parts();
+    
+    tracing::info!(
+        status = parts.status.as_u16(),
+        elapsed_ms = start.elapsed().as_millis(),
+        "[VSOCK] Step 6: Received HTTP response, reading body..."
+    );
+    
     let body_bytes = body
         .collect()
         .await
-        .map_err(|e| ConnectorError::other(e.into(), None))?
+        .map_err(|e| {
+            tracing::error!(
+                error = %e,
+                "[VSOCK] FAILED at Step 6: Failed to read response body"
+            );
+            ConnectorError::other(e.into(), None)
+        })?
         .to_bytes();
 
     let status_code = SmithyStatusCode::try_from(parts.status.as_u16())
         .map_err(|e| ConnectorError::other(e.into(), None))?;
+
+    // Log response details (truncate body for logging)
+    let body_preview = if body_bytes.len() > 200 {
+        format!("{}... ({} bytes total)", 
+            String::from_utf8_lossy(&body_bytes[..200]), 
+            body_bytes.len())
+    } else {
+        String::from_utf8_lossy(&body_bytes).to_string()
+    };
+
+    tracing::info!(
+        status = status_code.as_u16(),
+        body_len = body_bytes.len(),
+        body_preview = %body_preview,
+        elapsed_ms = start.elapsed().as_millis(),
+        "[VSOCK] Step 7: Request complete!"
+    );
 
     let sdk_response = aws_smithy_runtime_api::client::orchestrator::HttpResponse::new(
         status_code,
