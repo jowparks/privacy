@@ -30,6 +30,8 @@ pub const VSOCK_CID_HOST: u32 = 3;
 /// Default vsock ports for AWS services (must match vsock-proxy config on parent)
 pub const VSOCK_PORT_KMS: u32 = 8000;
 pub const VSOCK_PORT_DYNAMODB: u32 = 8001;
+pub const VSOCK_PORT_STS: u32 = 8002;
+pub const VSOCK_PORT_IMDS: u32 = 8003;
 
 /// Configuration for vsock-based AWS connectivity
 #[derive(Debug, Clone)]
@@ -38,6 +40,10 @@ pub struct VsockConfig {
     pub kms_port: u32,
     /// vsock port for DynamoDB service
     pub dynamodb_port: u32,
+    /// vsock port for STS service (credential refresh)
+    pub sts_port: u32,
+    /// vsock port for EC2 Instance Metadata Service (IMDS)
+    pub imds_port: u32,
     /// AWS region
     pub region: String,
 }
@@ -47,6 +53,8 @@ impl Default for VsockConfig {
         Self {
             kms_port: VSOCK_PORT_KMS,
             dynamodb_port: VSOCK_PORT_DYNAMODB,
+            sts_port: VSOCK_PORT_STS,
+            imds_port: VSOCK_PORT_IMDS,
             region: "us-east-1".to_string(),
         }
     }
@@ -67,9 +75,17 @@ impl VsockConfig {
             self.kms_port
         } else if endpoint.contains("dynamodb.") {
             self.dynamodb_port
+        } else if endpoint.contains("sts.") {
+            self.sts_port
+        } else if endpoint.contains("169.254.169.254") {
+            self.imds_port
         } else {
-            // Default to KMS port for unknown endpoints
-            self.kms_port
+            tracing::warn!(
+                endpoint = %endpoint,
+                "Unknown endpoint, defaulting to STS port. \
+                 Add explicit port mapping if this is unexpected."
+            );
+            self.sts_port
         }
     }
 }
